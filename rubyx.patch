@@ -1,0 +1,262 @@
+From 19992afe275e34b946bb98fd2b60a535d0f63845 Mon Sep 17 00:00:00 2001
+From: Aeron-Aeron <aeronrules2@gmail.com>
+Date: Tue, 13 Jan 2026 08:37:12 +0000
+Subject: [PATCH] rubyx: camera: Implement torch light control
+
+* Took reference from: https://github.com/PixelOS-Devices/android_device_motorola_cancunf/commit/2c27f45dc79fe6c0d00ff01f2d55a42f090a744e
+
+Signed-off-by: Aeron-Aeron <aeronrules2@gmail.com>
+Signed-off-by: rajdeep-3305 <rajdeepbiswas3305@gmail.com>
+---
+ camera/Android.bp                  |  15 +++
+ camera/CameraProviderExtension.cpp | 166 +++++++++++++++++++++++++++++
+ device.mk                          |   3 +
+ sepolicy/vendor/cameraserver.te    |   2 +
+ sepolicy/vendor/genfs_contexts     |   4 +
+ sepolicy/vendor/mtk_hal_camera.te  |   2 +
+ 6 files changed, 192 insertions(+)
+ create mode 100644 camera/Android.bp
+ create mode 100644 camera/CameraProviderExtension.cpp
+
+diff --git a/camera/Android.bp b/camera/Android.bp
+new file mode 100644
+index 0000000..6a48369
+--- /dev/null
++++ b/camera/Android.bp
+@@ -0,0 +1,15 @@
++cc_library_static {
++    name: "libcameraservice_extension.rubyx",
++    srcs: ["CameraProviderExtension.cpp"],
++    include_dirs: [
++        "frameworks/av/services/camera/libcameraservice",
++    ],
++    shared_libs: [
++        "liblog",
++    ],
++    cflags: [
++        "-Wall",
++        "-Wextra",
++        "-Werror",
++    ],
++}
+diff --git a/camera/CameraProviderExtension.cpp b/camera/CameraProviderExtension.cpp
+new file mode 100644
+index 0000000..5ba20a9
+--- /dev/null
++++ b/camera/CameraProviderExtension.cpp
+@@ -0,0 +1,166 @@
++#include "common/CameraProviderExtension.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include <log/log.h>
++
++namespace {
++
++constexpr const char* kTorchNode = "/dev/flashlight";
++
++struct flashlight_user_arg {
++    int type_id;
++    int ct_id;
++    int arg;
++};
++
++#ifndef FLASHLIGHT_MAGIC
++#define FLASHLIGHT_MAGIC 'S'
++#endif
++
++#define FLASH_IOC_SET_TIME_OUT_TIME_MS _IOR(FLASHLIGHT_MAGIC, 100, int)
++#define FLASH_IOC_SET_DUTY _IOR(FLASHLIGHT_MAGIC, 110, int)
++#define FLASH_IOC_SET_ONOFF _IOR(FLASHLIGHT_MAGIC, 115, int)
++
++#define FLASH_IOC_GET_MAX_TORCH_DUTY _IOWR(FLASHLIGHT_MAGIC, 230, int)
++#define FLASH_IOC_GET_CURRENT_TORCH_DUTY _IOR(FLASHLIGHT_MAGIC, 232, int)
++
++struct TorchDeviceKey {
++    int typeId;
++    int ctId;
++};
++
++TorchDeviceKey& cachedTorchKey() {
++    static TorchDeviceKey key{-1, -1};
++    return key;
++}
++
++int doTorchIoctl(unsigned int cmd, int32_t* inout, const TorchDeviceKey& key) {
++    int fd = TEMP_FAILURE_RETRY(open(kTorchNode, O_RDWR | O_CLOEXEC));
++    if (fd < 0) {
++        return -errno;
++    }
++
++    flashlight_user_arg arg{};
++    // MTK core uses 1-based IDs (see flashlight_get_type_id/flashlight_get_ct_id).
++    arg.type_id = key.typeId;
++    arg.ct_id = key.ctId;
++    arg.arg = (inout != nullptr) ? *inout : 0;
++
++    int ret = TEMP_FAILURE_RETRY(ioctl(fd, cmd, &arg));
++    int savedErrno = errno;
++    close(fd);
++
++    if (ret < 0) {
++        return -savedErrno;
++    }
++    if (inout != nullptr) {
++        *inout = arg.arg;
++    }
++    return 0;
++}
++
++int doTorchIoctl(unsigned int cmd, int32_t* inout) {
++    TorchDeviceKey key = cachedTorchKey();
++    if (key.typeId <= 0 || key.ctId <= 0) {
++        key.typeId = 1;
++        key.ctId = 1;
++    }
++    return doTorchIoctl(cmd, inout, key);
++}
++
++bool ensureTorchKey() {
++    TorchDeviceKey& key = cachedTorchKey();
++    if (key.typeId > 0 && key.ctId > 0) return true;
++
++    for (int typeId = 1; typeId <= 2; typeId++) {
++        for (int ctId = 1; ctId <= 2; ctId++) {
++            TorchDeviceKey candidate{typeId, ctId};
++            int32_t max = 0;
++            if (doTorchIoctl(FLASH_IOC_GET_MAX_TORCH_DUTY, &max, candidate) == 0 && max >= 1) {
++                key = candidate;
++                ALOGI("Using /dev/flashlight torch key typeId=%d ctId=%d (max=%d)",
++                      key.typeId, key.ctId, max);
++                return true;
++            }
++        }
++    }
++
++    // Fall back to 1/1 (still better than 0/0, which is always invalid).
++    key.typeId = 1;
++    key.ctId = 1;
++    return false;
++}
++
++int32_t clampTorchLevel(int32_t level, int32_t maxLevel) {
++    if (maxLevel <= 0) return 1;
++    if (level <= 0) return 1;
++    if (level > maxLevel) return maxLevel;
++    return level;
++}
++
++} // namespace
++
++bool supportsTorchStrengthControlExt() {
++    int fd = TEMP_FAILURE_RETRY(open(kTorchNode, O_RDWR | O_CLOEXEC));
++    if (fd < 0) return false;
++    close(fd);
++
++    (void)ensureTorchKey();
++
++    int32_t max = 0;
++    if (doTorchIoctl(FLASH_IOC_GET_MAX_TORCH_DUTY, &max) != 0) return false;
++    return max >= 1;
++}
++
++int32_t getTorchDefaultStrengthLevelExt() {
++    int32_t max = getTorchMaxStrengthLevelExt();
++    return clampTorchLevel(6, max);
++}
++
++int32_t getTorchMaxStrengthLevelExt() {
++    (void)ensureTorchKey();
++    int32_t max = 0;
++    if (doTorchIoctl(FLASH_IOC_GET_MAX_TORCH_DUTY, &max) != 0) {
++        return 1;
++    }
++    if (max < 1) return 1;
++    return max;
++}
++
++int32_t getTorchStrengthLevelExt() {
++    (void)ensureTorchKey();
++    int32_t cur = 0;
++    if (doTorchIoctl(FLASH_IOC_GET_CURRENT_TORCH_DUTY, &cur) != 0) {
++        return 0;
++    }
++    return cur;
++}
++
++void setTorchStrengthLevelExt(int32_t torchStrength, bool enabled) {
++    if (!supportsTorchStrengthControlExt()) return;
++
++    if (!enabled || torchStrength <= 0) {
++        int32_t off = 0;
++        (void)doTorchIoctl(FLASH_IOC_SET_ONOFF, &off);
++        return;
++    }
++
++    const int32_t max = getTorchMaxStrengthLevelExt();
++    int32_t level = clampTorchLevel(torchStrength, max);
++
++    // Set level, disable timeout, then enable.
++    (void)doTorchIoctl(FLASH_IOC_SET_DUTY, &level);
++    int32_t timeoutMs = 0;
++    (void)doTorchIoctl(FLASH_IOC_SET_TIME_OUT_TIME_MS, &timeoutMs);
++    int32_t on = 1;
++    int rc = doTorchIoctl(FLASH_IOC_SET_ONOFF, &on);
++    if (rc != 0) {
++        ALOGW("Torch enable failed (%d): %s", -rc, strerror(-rc));
++    }
++}
+diff --git a/device.mk b/device.mk
+index 1a4db5d..07443d7 100644
+--- a/device.mk
++++ b/device.mk
+@@ -304,6 +304,9 @@ PRODUCT_COPY_FILES += \
+ PRODUCT_PACKAGES += \
+     android.hardware.hardware_keystore.km41.xml
+ 
++# Camera
++$(call soong_config_set,libcameraservice,ext_lib,//$(DEVICE_PATH):libcameraservice_extension.rubyx)
++
+ # Power
+ PRODUCT_PACKAGES += \
+     android.hardware.power-service.lineage-libperfmgr \
+diff --git a/sepolicy/vendor/cameraserver.te b/sepolicy/vendor/cameraserver.te
+index cf538e9..abaedab 100644
+--- a/sepolicy/vendor/cameraserver.te
++++ b/sepolicy/vendor/cameraserver.te
+@@ -1 +1,3 @@
+ get_prop(cameraserver, vendor_camera_prop)
++
++allow cameraserver flashlight_device:chr_file rw_file_perms;
+diff --git a/sepolicy/vendor/genfs_contexts b/sepolicy/vendor/genfs_contexts
+index 24555fc..8f1f427 100644
+--- a/sepolicy/vendor/genfs_contexts
++++ b/sepolicy/vendor/genfs_contexts
+@@ -25,6 +25,10 @@ genfscon sysfs /devices/platform/11d01000.i2c7/i2c-7/7-0066/power_supply/cp_mast
+ genfscon sysfs /devices/platform/11d01000.i2c7/i2c-7/7-0064/power_supply/cp_master                 u:object_r:sysfs_batteryinfo:s0
+ genfscon sysfs /devices/platform/11281000.i2c11/i2c-11/11-0066/power_supply/cp_slave               u:object_r:sysfs_batteryinfo:s0
+ genfscon sysfs /devices/platform/11281000.i2c11/i2c-11/11-0075/power_supply/cp_slave               u:object_r:sysfs_batteryinfo:s0
++
++# Flashlight
++genfscon sysfs /devices/platform/flashlights_mt6360/leds/torch-light0/brightness                   u:object_r:sysfs_leds:s0
++genfscon sysfs /devices/platform/flashlights_mt6360/leds/flash-light0/brightness                   u:object_r:sysfs_leds:s0
+ genfscon sysfs /devices/platform/11281000.i2c11/i2c-11/11-0055/power_supply/bms                    u:object_r:sysfs_batteryinfo:s0
+ genfscon sysfs /devices/platform/11281000.i2c11/i2c-11/11-0055/verify_digest                       u:object_r:sysfs_batteryinfo:s0
+ genfscon sysfs /devices/platform/pd_adapter/Charging_Adapter/pd_adapter                            u:object_r:sysfs_pwrinfo:s0
+diff --git a/sepolicy/vendor/mtk_hal_camera.te b/sepolicy/vendor/mtk_hal_camera.te
+index dda173f..b3b485b 100644
+--- a/sepolicy/vendor/mtk_hal_camera.te
++++ b/sepolicy/vendor/mtk_hal_camera.te
+@@ -8,5 +8,7 @@ allow mtk_hal_camera camera_persist_file:dir search;
+ allow mtk_hal_camera sysfs_therm:dir search;
+ allow mtk_hal_camera sysfs_therm:file rw_file_perms;
+ 
++rw_dir_file(mtk_hal_camera, sysfs_leds)
++
+ get_prop(mtk_hal_camera, vendor_camera_prop)
+ set_prop(mtk_hal_camera, vendor_camera_prop)
