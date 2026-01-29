@@ -11,12 +11,12 @@ $(call inherit-product, $(SRC_TARGET_DIR)/product/full_base_telephony.mk)
 $(call inherit-product, device/xiaomi/rubyx/device.mk)
 
 # Inherit some common AlphaDroid stuff.
-$(call inherit-product, vendor/alpha/config/common_full_phone.mk)
+$(call inherit-product, vendor/euclid/config/common_full_phone.mk)
 
 # Enable animation override to fix lag on fewer mediatek devices
 PERF_ANIM_OVERRIDE := true
 
-PRODUCT_NAME := alpha_rubyx
+PRODUCT_NAME := euclid_rubyx
 PRODUCT_DEVICE := rubyx
 PRODUCT_MANUFACTURER := Xiaomi
 PRODUCT_BRAND := Redmi
@@ -46,5 +46,7 @@ TARGET_INCLUDE_LIVE_WALLPAPERS := false
 TARGET_SUPPORTS_GOOGLE_RECORDER := false
 
 # Maintainer
-ALPHA_BUILD_TYPE := Official
-ALPHA_MAINTAINER := YagizErdemir
+EUCLID_MAINTAINER := Radioactive
+
+EUCLID_DEVICE := Redmi_Note_12_Pro_5G_(ruby)
+EUCLID_PROCESSOR := MediaTek_Dimensity_1080
