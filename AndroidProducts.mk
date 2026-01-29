@@ -4,4 +4,4 @@
 #
 
 PRODUCT_MAKEFILES := \
-    $(LOCAL_DIR)/alpha_rubyx.mk
+    $(LOCAL_DIR)/euclid_rubyx.mk
